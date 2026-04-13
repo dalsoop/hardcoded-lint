@@ -1,0 +1,11 @@
+[package]
+name = "hardcoded-lint"
+version = "0.1.0"
+edition = "2024"
+description = "Compile-time lint that catches hardcoded IPs, secrets, and config values in Rust source code"
+license = "MIT"
+repository = "https://github.com/dalsoop/hardcoded-lint"
+keywords = ["lint", "security", "hardcoded", "build-script"]
+categories = ["development-tools", "no-std"]
+
+[dependencies]

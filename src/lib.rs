@@ -68,6 +68,10 @@ enum BuiltinRule {
     VmidDefault,
     GitUrl,
     Localhost,
+    Port,
+    Domain,
+    Email,
+    MagicNumber,
 }
 
 impl Checker {
@@ -75,6 +79,10 @@ impl Checker {
     pub fn all(mut self) -> Self {
         self.rules = vec![
             BuiltinRule::Ipv4,
+            BuiltinRule::Port,
+            BuiltinRule::Domain,
+            BuiltinRule::Email,
+            BuiltinRule::MagicNumber,
             BuiltinRule::Credentials,
             BuiltinRule::EnvFallback,
             BuiltinRule::ConstConfig,
@@ -99,6 +107,14 @@ impl Checker {
     pub fn git_url(mut self) -> Self { self.rules.push(BuiltinRule::GitUrl); self }
     /// Catch localhost:PORT (4+ digit).
     pub fn localhost(mut self) -> Self { self.rules.push(BuiltinRule::Localhost); self }
+    /// Catch hardcoded port numbers (:XXXX in strings).
+    pub fn port(mut self) -> Self { self.rules.push(BuiltinRule::Port); self }
+    /// Catch hardcoded domain names (.com, .net, .kr, .io, .org).
+    pub fn domain(mut self) -> Self { self.rules.push(BuiltinRule::Domain); self }
+    /// Catch hardcoded email addresses.
+    pub fn email(mut self) -> Self { self.rules.push(BuiltinRule::Email); self }
+    /// Catch magic numbers in Duration, sleep, timeout, retry.
+    pub fn magic_number(mut self) -> Self { self.rules.push(BuiltinRule::MagicNumber); self }
 
     /// Add a custom deny pattern.
     pub fn deny(mut self, pattern: &str, message: &str) -> Self {
@@ -151,6 +167,10 @@ impl Checker {
             BuiltinRule::VmidDefault => Rule { name: "hardcoded-vmid", msg: "hardcoded VMID", check: detect_vmid, exempt: no_exempt },
             BuiltinRule::GitUrl => Rule { name: "hardcoded-git-url", msg: "hardcoded Git URL", check: detect_git_url, exempt: no_exempt },
             BuiltinRule::Localhost => Rule { name: "hardcoded-localhost", msg: "hardcoded localhost:PORT", check: detect_localhost, exempt: no_exempt },
+            BuiltinRule::Port => Rule { name: "hardcoded-port", msg: "hardcoded port number", check: detect_port, exempt: exempt_port },
+            BuiltinRule::Domain => Rule { name: "hardcoded-domain", msg: "hardcoded domain name", check: detect_domain, exempt: exempt_domain },
+            BuiltinRule::Email => Rule { name: "hardcoded-email", msg: "hardcoded email address", check: detect_email, exempt: exempt_email },
+            BuiltinRule::MagicNumber => Rule { name: "magic-number", msg: "magic number in timeout/sleep/retry", check: detect_magic_number, exempt: no_exempt },
         }).collect();
 
         rules
@@ -272,6 +292,90 @@ fn detect_localhost(line: &str) -> bool {
     false
 }
 
+/// 하드코딩 포트 — 문자열 내 :XXXX (4자리 이상)
+fn detect_port(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    for i in 0..bytes.len().saturating_sub(4) {
+        if bytes[i] == b':' && bytes[i+1].is_ascii_digit() {
+            let port_str: String = line[i+1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            if port_str.len() >= 4 {
+                if let Ok(p) = port_str.parse::<u32>() {
+                    if p >= 1024 && p <= 65535 { return true; }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn exempt_port(line: &str) -> bool {
+    // format! 동적 포트
+    if line.contains("format!(") && line.contains('{') { return true; }
+    // localhost/bind — 다른 규칙이 처리
+    if line.contains("localhost") || line.contains("0.0.0.0") || line.contains("127.0.0.1") { return true; }
+    // HTTP status codes (200, 302, 404 등) — :XXX 가 아님
+    false
+}
+
+/// 하드코딩 도메인 — "xxx.com", "xxx.kr" 등
+fn detect_domain(line: &str) -> bool {
+    let tlds = [".com\"", ".net\"", ".kr\"", ".io\"", ".org\"", ".dev\"",
+                ".com/", ".net/", ".kr/", ".io/", ".org/", ".dev/",
+                ".com'", ".net'", ".kr'", ".io'", ".org'", ".dev'",
+                ".com)", ".net)", ".kr)", ".io)", ".org)"];
+    for tld in &tlds {
+        if line.contains(tld) { return true; }
+    }
+    false
+}
+
+fn exempt_domain(line: &str) -> bool {
+    // format! 동적 도메인
+    if line.contains("format!(") && line.contains('{') { return true; }
+    // contains/starts_with 패턴 검사
+    if line.contains("contains(") || line.contains("ends_with(") || line.contains("starts_with(") { return true; }
+    false
+}
+
+/// 하드코딩 이메일 — "user@domain.xxx"
+fn detect_email(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    for i in 1..bytes.len().saturating_sub(4) {
+        if bytes[i] == b'@' && bytes[i-1].is_ascii_alphanumeric() && bytes[i+1].is_ascii_alphanumeric() {
+            // @ 뒤에 도메인.tld 패턴 확인
+            let after = &line[i+1..];
+            if after.contains('.') && !after.starts_with('{') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn exempt_email(line: &str) -> bool {
+    // format! 동적
+    if line.contains("format!(") && line.contains('{') { return true; }
+    // doc comment 예시
+    if line.trim().starts_with("///") || line.trim().starts_with("//!") { return true; }
+    // noreply, example 도메인
+    if line.contains("noreply") || line.contains("example.com") { return true; }
+    false
+}
+
+/// 매직넘버 — Duration::from_secs(N), sleep(N), timeout(N)
+fn detect_magic_number(line: &str) -> bool {
+    for prefix in ["Duration::from_secs(", "Duration::from_millis(", "sleep(", "timeout("] {
+        if let Some(pos) = line.find(prefix) {
+            let after = &line[pos + prefix.len()..];
+            let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !num.is_empty() && num != "0" && num != "1" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn no_exempt(_: &str) -> bool { false }
 
 // ─── Scanner ─────────────────────────────────────────────────
@@ -363,6 +467,36 @@ mod tests {
         assert!(detect_const(r#"const X: &str = "/opt/app";"#));
         assert!(detect_const(r#"pub const U: &str = "https://api.example.com";"#));
         assert!(!detect_const(r#"const N: &str = "myapp";"#));
+    }
+
+    #[test]
+    fn port_detection() {
+        assert!(detect_port(":8080/path"));
+        assert!(detect_port("url:4566\""));
+        assert!(!detect_port(":80/"));
+        assert!(!detect_port("no port here"));
+    }
+
+    #[test]
+    fn domain_detection() {
+        assert!(detect_domain(r#""example.com""#));
+        assert!(detect_domain(r#""test.internal.kr""#));
+        assert!(!detect_domain("no domain"));
+    }
+
+    #[test]
+    fn email_detection() {
+        assert!(detect_email(r#""user@example.com""#));
+        assert!(detect_email("devops@internal.kr"));
+        assert!(!detect_email("no email"));
+    }
+
+    #[test]
+    fn magic_number_detection() {
+        assert!(detect_magic_number("Duration::from_secs(5)"));
+        assert!(detect_magic_number("Duration::from_millis(3000)"));
+        assert!(!detect_magic_number("Duration::from_secs(0)"));
+        assert!(!detect_magic_number("Duration::from_secs(1)"));
     }
 
     #[test]

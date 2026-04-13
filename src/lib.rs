@@ -75,6 +75,8 @@ enum BuiltinRule {
     Version,
     Retry,
     AwsResource,
+    Timezone,
+    Sql,
 }
 
 impl Checker {
@@ -89,6 +91,8 @@ impl Checker {
             BuiltinRule::Version,
             BuiltinRule::Retry,
             BuiltinRule::AwsResource,
+            BuiltinRule::Timezone,
+            BuiltinRule::Sql,
             BuiltinRule::Credentials,
             BuiltinRule::EnvFallback,
             BuiltinRule::ConstConfig,
@@ -127,6 +131,10 @@ impl Checker {
     pub fn retry(mut self) -> Self { self.rules.push(BuiltinRule::Retry); self }
     /// Catch hardcoded AWS resources (region, ARN, S3 bucket).
     pub fn aws(mut self) -> Self { self.rules.push(BuiltinRule::AwsResource); self }
+    /// Catch hardcoded timezone ("Asia/Seoul", "UTC").
+    pub fn timezone(mut self) -> Self { self.rules.push(BuiltinRule::Timezone); self }
+    /// Catch hardcoded SQL queries (SELECT, INSERT, UPDATE, DELETE, CREATE/ALTER TABLE).
+    pub fn sql(mut self) -> Self { self.rules.push(BuiltinRule::Sql); self }
 
     /// Add a custom deny pattern.
     pub fn deny(mut self, pattern: &str, message: &str) -> Self {
@@ -186,6 +194,8 @@ impl Checker {
             BuiltinRule::Version => Rule { name: "hardcoded-version", msg: "hardcoded version string", check: detect_version, exempt: exempt_version },
             BuiltinRule::Retry => Rule { name: "hardcoded-retry", msg: "hardcoded retry/loop count", check: detect_retry, exempt: no_exempt },
             BuiltinRule::AwsResource => Rule { name: "hardcoded-aws", msg: "hardcoded AWS region/ARN/S3", check: detect_aws, exempt: no_exempt },
+            BuiltinRule::Timezone => Rule { name: "hardcoded-timezone", msg: "hardcoded timezone", check: detect_timezone, exempt: no_exempt },
+            BuiltinRule::Sql => Rule { name: "hardcoded-sql", msg: "hardcoded SQL query — use prepared statements or query files", check: detect_sql, exempt: no_exempt },
         }).collect();
 
         rules
@@ -459,6 +469,25 @@ fn detect_aws(line: &str) -> bool {
     false
 }
 
+/// 하드코딩 timezone — "Asia/Seoul", "US/Eastern" 등
+fn detect_timezone(line: &str) -> bool {
+    for tz in ["Asia/", "US/", "Europe/", "Pacific/", "America/", "Australia/", "Africa/"] {
+        if line.contains(&format!("\"{tz}")) { return true; }
+    }
+    false
+}
+
+/// 하드코딩 SQL — SELECT/INSERT/UPDATE/DELETE/CREATE TABLE/ALTER TABLE
+fn detect_sql(line: &str) -> bool {
+    let upper = line.to_uppercase();
+    for kw in ["SELECT ", "INSERT ", "UPDATE ", "DELETE FROM", "CREATE TABLE", "ALTER TABLE", "DROP TABLE"] {
+        if upper.contains(kw) && (line.contains('"') || line.contains('\'')) {
+            return true;
+        }
+    }
+    false
+}
+
 fn no_exempt(_: &str) -> bool { false }
 
 // ─── Scanner ─────────────────────────────────────────────────
@@ -602,6 +631,20 @@ mod tests {
         assert!(detect_aws("arn:aws:s3:::my-bucket"));
         assert!(detect_aws("s3://my-bucket/path"));
         assert!(!detect_aws("normal text"));
+    }
+
+    #[test]
+    fn timezone_detection() {
+        assert!(detect_timezone(r#"set-timezone "Asia/Seoul""#));
+        assert!(detect_timezone(r#""Europe/London""#));
+        assert!(!detect_timezone("normal text"));
+    }
+
+    #[test]
+    fn sql_detection() {
+        assert!(detect_sql(r#""SELECT name FROM users""#));
+        assert!(detect_sql(r#"'INSERT INTO logs VALUES (?)'"#));
+        assert!(!detect_sql("no sql here"));
     }
 
     #[test]

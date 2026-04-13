@@ -72,6 +72,9 @@ enum BuiltinRule {
     Domain,
     Email,
     MagicNumber,
+    Version,
+    Retry,
+    AwsResource,
 }
 
 impl Checker {
@@ -83,6 +86,9 @@ impl Checker {
             BuiltinRule::Domain,
             BuiltinRule::Email,
             BuiltinRule::MagicNumber,
+            BuiltinRule::Version,
+            BuiltinRule::Retry,
+            BuiltinRule::AwsResource,
             BuiltinRule::Credentials,
             BuiltinRule::EnvFallback,
             BuiltinRule::ConstConfig,
@@ -115,6 +121,12 @@ impl Checker {
     pub fn email(mut self) -> Self { self.rules.push(BuiltinRule::Email); self }
     /// Catch magic numbers in Duration, sleep, timeout, retry.
     pub fn magic_number(mut self) -> Self { self.rules.push(BuiltinRule::MagicNumber); self }
+    /// Catch hardcoded version strings ("v1.2.3", "1.0.0").
+    pub fn version(mut self) -> Self { self.rules.push(BuiltinRule::Version); self }
+    /// Catch hardcoded retry/loop counts (for _ in 0..N).
+    pub fn retry(mut self) -> Self { self.rules.push(BuiltinRule::Retry); self }
+    /// Catch hardcoded AWS resources (region, ARN, S3 bucket).
+    pub fn aws(mut self) -> Self { self.rules.push(BuiltinRule::AwsResource); self }
 
     /// Add a custom deny pattern.
     pub fn deny(mut self, pattern: &str, message: &str) -> Self {
@@ -171,6 +183,9 @@ impl Checker {
             BuiltinRule::Domain => Rule { name: "hardcoded-domain", msg: "hardcoded domain name", check: detect_domain, exempt: exempt_domain },
             BuiltinRule::Email => Rule { name: "hardcoded-email", msg: "hardcoded email address", check: detect_email, exempt: exempt_email },
             BuiltinRule::MagicNumber => Rule { name: "magic-number", msg: "magic number in timeout/sleep/retry", check: detect_magic_number, exempt: no_exempt },
+            BuiltinRule::Version => Rule { name: "hardcoded-version", msg: "hardcoded version string", check: detect_version, exempt: exempt_version },
+            BuiltinRule::Retry => Rule { name: "hardcoded-retry", msg: "hardcoded retry/loop count", check: detect_retry, exempt: no_exempt },
+            BuiltinRule::AwsResource => Rule { name: "hardcoded-aws", msg: "hardcoded AWS region/ARN/S3", check: detect_aws, exempt: no_exempt },
         }).collect();
 
         rules
@@ -376,6 +391,74 @@ fn detect_magic_number(line: &str) -> bool {
     false
 }
 
+/// 하드코딩 버전 — "v1.2.3" 또는 "1.2.3" (const/string 내)
+fn detect_version(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    for i in 0..bytes.len().saturating_sub(4) {
+        // "v1.2.3" or "1.2.3" inside quotes
+        if bytes[i] == b'"' {
+            let start = if i + 1 < bytes.len() && bytes[i + 1] == b'v' { i + 2 } else { i + 1 };
+            let rest = &line[start..];
+            // X.Y.Z 패턴 확인
+            let parts: Vec<&str> = rest.splitn(4, '.').collect();
+            if parts.len() >= 3 {
+                let all_numeric = parts[..3].iter().all(|p| {
+                    let num_part: String = p.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    !num_part.is_empty()
+                });
+                if all_numeric {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn exempt_version(line: &str) -> bool {
+    // Cargo.toml 의존성 버전 — build.rs에서 스캔 안 함
+    // crate version 선언
+    if line.contains("version =") && (line.contains("[package]") || line.contains("edition")) { return true; }
+    // clap version 출력
+    if line.contains("version!") || line.contains("crate_version!") { return true; }
+    false
+}
+
+/// 하드코딩 리트라이/루프 횟수 — for _ in 0..N (N >= 3)
+fn detect_retry(line: &str) -> bool {
+    if let Some(pos) = line.find("0..") {
+        let after = &line[pos + 3..];
+        let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = num.parse::<u32>() {
+            if n >= 3 { return true; }
+        }
+    }
+    // retries: N, max_retries = N
+    for prefix in ["retries:", "retries =", "max_retries"] {
+        if let Some(pos) = line.find(prefix) {
+            let after = &line[pos + prefix.len()..];
+            let num: String = after.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = num.parse::<u32>() {
+                if n >= 2 { return true; }
+            }
+        }
+    }
+    false
+}
+
+/// 하드코딩 AWS 리소스 — region, ARN, S3 URI
+fn detect_aws(line: &str) -> bool {
+    if line.contains("us-east-") || line.contains("us-west-") || line.contains("ap-northeast-")
+        || line.contains("eu-west-") || line.contains("ap-southeast-")
+    {
+        return true;
+    }
+    if line.contains("arn:aws:") || line.contains("s3://") {
+        return true;
+    }
+    false
+}
+
 fn no_exempt(_: &str) -> bool { false }
 
 // ─── Scanner ─────────────────────────────────────────────────
@@ -497,6 +580,28 @@ mod tests {
         assert!(detect_magic_number("Duration::from_millis(3000)"));
         assert!(!detect_magic_number("Duration::from_secs(0)"));
         assert!(!detect_magic_number("Duration::from_secs(1)"));
+    }
+
+    #[test]
+    fn version_detection() {
+        assert!(detect_version(r#"const V: &str = "v2.63.1";"#));
+        assert!(detect_version(r#""1.0.0""#));
+        assert!(!detect_version(r#""hello""#));
+    }
+
+    #[test]
+    fn retry_detection() {
+        assert!(detect_retry("for _ in 0..24 {"));
+        assert!(detect_retry("retries: 5"));
+        assert!(!detect_retry("for _ in 0..2 {"));
+    }
+
+    #[test]
+    fn aws_detection() {
+        assert!(detect_aws(r#""us-east-1""#));
+        assert!(detect_aws("arn:aws:s3:::my-bucket"));
+        assert!(detect_aws("s3://my-bucket/path"));
+        assert!(!detect_aws("normal text"));
     }
 
     #[test]
